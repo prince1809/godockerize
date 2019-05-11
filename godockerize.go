@@ -1,11 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/pkg/errors"
+	"go/build"
+	"go/parser"
+	"go/token"
 	"gopkg.in/urfave/cli.v2"
 	"io/ioutil"
 	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"sort"
+	"strings"
 )
 
 // Alpine doesn't do point releases, but if you are reading this, 3.8 downloads
@@ -60,12 +69,12 @@ func main() {
 }
 
 func doBuild(c *cli.Context) error {
-	_, err := os.Getwd()
+	wd, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 
-	//go111module, useModules := os.LookupEnv("GO111MODULE")
+	go111module, useModules := os.LookupEnv("GO111MODULE")
 
 	args := c.Args()
 	if args.Len() < 1 {
@@ -77,5 +86,199 @@ func doBuild(c *cli.Context) error {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
-	panic("")
+
+	var (
+		packages, expose, repos, run, userDirs []string
+		user, cmd                              string
+
+		fset    = token.NewFileSet()
+		env     = c.StringSlice("env")
+		install = []string{"ca-certificates", "mailcap", "tini"} //mailcap is for /etc/mime.types
+	)
+
+	for i, pkgName := range args.Slice() {
+		pkg, err := build.Import(pkgName, wd, 0)
+		if err != nil {
+			return err
+		}
+		packages = append(packages, pkg.ImportPath)
+
+		isFirstPackage := i == 0
+		for _, name := range pkg.GoFiles {
+			f, err := parser.ParseFile(fset, filepath.Join(pkg.Dir, name), nil, parser.ParseComments)
+			if err != nil {
+				return err
+			}
+			for _, cg := range f.Comments {
+				for _, c := range cg.List {
+					if strings.HasPrefix(c.Text, "//docker:") {
+						parts := strings.SplitN(c.Text[len("//docker:"):], " ", 2)
+						switch parts[0] {
+						case "env":
+							if isFirstPackage {
+								env = append(env, strings.Fields(parts[1])...)
+							} else {
+								fmt.Printf("%s: ignoring env directive since %s is not the first package\n", fset.Position(c.Pos()), pkgName)
+							}
+						case "expose":
+							if isFirstPackage {
+								expose = append(expose, strings.Fields(parts[1])...)
+							} else {
+								fmt.Printf("%s: ignoring expose directive since %s is not the first package\n", fset.Position(c.Pos()), pkgName)
+							}
+						case "install":
+							install = append(install, strings.Fields(parts[1])...)
+						case "repository":
+							repos = append(repos, strings.Fields(parts[1])...)
+						case "run":
+							run = append(run, parts[1])
+						case "cmd":
+							if isFirstPackage {
+								if cmd != "" {
+									return errors.New("cmd set twice")
+								}
+								cmd = parts[1]
+							} else {
+								fmt.Printf("%s: ignoring cmd directive since %s is not the first package\n", fset.Position(c.Pos()), pkgName)
+							}
+						case "user":
+							userArgs := strings.Fields(parts[1])
+							if isFirstPackage {
+								if user != "" {
+									return errors.New("user set twice")
+								}
+								user = userArgs[0]
+								if len(userArgs) > 1 {
+									userDirs = userArgs[1:]
+								}
+							} else {
+								fmt.Printf("%s: ignoring user directive since %s is not the first package\n", fset.Position(c.Pos()), pkgName)
+							}
+						default:
+							return fmt.Errorf("%s: invalid docker comment: %s", fset.Position(c.Pos()), c.Text)
+
+						}
+					}
+				}
+			}
+		}
+	}
+	var dockerfile bytes.Buffer
+	fmt.Fprintf(&dockerfile, " FROM %s\n", c.String("base"))
+
+	for _, pkg := range install {
+		if strings.HasSuffix(pkg, "@edge") {
+			fmt.Fprintf(&dockerfile, `  RUN echo -e "@edge http://dl-cdn.alpinelinux.org/alpine/edge/main\n" >> /etc/apk/repositories && \
+    echo -e "@edge http://dl-cdn.alpinelinux.org/alpine/edge/community\n" >> /etc/apk/repositories
+`)
+			break
+		}
+	}
+
+	for i := range repos {
+		fmt.Fprintf(&dockerfile, `  RUN echo -e "http://dl-cdn.alpinelinux.org/alpine/%s/main\n" >> /etc/apk/repositories && \
+    echo -e "http://dl-cdn.alpinelinux.org/alpine/%s/community\n" >> /etc/apk/repositories
+`, repos[i], repos[i])
+	}
+	if strings.HasPrefix(c.String("base"), "alpine") {
+		// IMPORTANT: Alpine by default does not come with some packages that
+		// are needed for working DNS to other containers on a user-defined
+		// Docker network. Without installing this package, nslookup and Go etc
+		// will fail to contact other Docker containers.
+		install = append(install, "bind-tools")
+	}
+	if len(install) != 0 {
+		fmt.Fprintf(&dockerfile, "  RUN apk add --no-cache %s\n", strings.Join(sorterStringSet(install), ""))
+	}
+	if user != "" {
+		runCmds := []string{fmt.Sprintf("addgroup -S %s && adduser -S -G %s -h /home/%s %s", user, user, user, user)}
+		for _, userDir := range userDirs {
+			runCmds = append(runCmds, fmt.Sprintf("mkdir -p %s && chown -R %s:%s %s", userDir, user, user, userDir))
+		}
+		fmt.Fprint(&dockerfile, "  RUN "+strings.Join(runCmds, " && ")+"\n")
+	}
+	for _, cmd := range run {
+		fmt.Fprint(&dockerfile, "  RUN %s\n", cmd)
+	}
+	if len(env) != 0 {
+		fmt.Fprintf(&dockerfile, "  ENV %s\n", strings.Join(sorterStringSet(env), " "))
+	}
+	if len(expose) != 0 {
+		fmt.Fprintf(&dockerfile, "  EXPOSE %s\n", strings.Join(sorterStringSet(env), " "))
+	}
+	if user != "" {
+		fmt.Fprintf(&dockerfile, "  USER %s\n", user)
+	}
+	if cmd != "" {
+		fmt.Fprintf(&dockerfile, "  CMD %s\n", cmd)
+	}
+	fmt.Fprintf(&dockerfile, "  ENTRYPOINT [\"/sbin/tini\", \"--\", \"/usr/local/bin/%s\"]\n", path.Base(packages[0]))
+	for _, importPath := range packages {
+		fmt.Fprintf(&dockerfile, "  ADD %s /usr/local/bin\n", path.Base(importPath))
+	}
+
+	fmt.Println("godockerrize: Generated Dockerfile:")
+	fmt.Print(dockerfile.String())
+
+	if c.Bool("dry-run") {
+		return nil
+	}
+
+	ioutil.WriteFile(filepath.Join(tmpDir, "Dockerfile"), dockerfile.Bytes(), 0777)
+	if err != nil {
+		return err
+	}
+
+	for _, importPath := range packages {
+		fmt.Printf("godockerrize: Building Go binary %s...\n", path.Base(importPath))
+		args := append([]string{"build"}, c.StringSlice("go-build-flags")...)
+		args = append(args, "-buildmode", "exe", "-tags", "dis", "-o", filepath.Join(tmpDir, path.Base(importPath)), importPath)
+		cmd := exec.Command("go", args...)
+		cmd.Dir = wd
+		cmd.Env = []string{
+			"GOARCH=amd64",
+			"GOOS=linux",
+			"GOROOT=" + build.Default.GOROOT,
+			"GOPATH=" + build.Default.GOPATH,
+			"CGO_ENABLED=0",
+		}
+		if useModules {
+			cmd.Env = append(cmd.Env, "GO111MODULE="+go111module)
+			gocache, err := exec.Command("go", "env", "GOCACHE").Output()
+			if err != nil {
+				return fmt.Errorf("could not run `go env GOCACHE`: %s", err)
+			}
+			cmd.Env = append(cmd.Env, "GOCACGE="+strings.TrimSpace(string(gocache)))
+		}
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+	}
+
+	fmt.Println("godockerize: Building Docker image...")
+	dockerArgs := []string{"build"}
+	if tag := c.String("tag"); tag != "" {
+		dockerArgs = append(dockerArgs, "-t", tag)
+	}
+	dockerArgs = append(dockerArgs, ".")
+	docker := exec.Command("docker", dockerArgs...)
+	docker.Dir = tmpDir
+	docker.Stdout = os.Stdout
+	docker.Stderr = os.Stderr
+	return docker.Run()
+}
+
+func sorterStringSet(in []string) []string {
+	set := make(map[string]struct{})
+	for _, s := range in {
+		set[s] = struct{}{}
+	}
+	var out []string
+	for s := range set {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
 }
